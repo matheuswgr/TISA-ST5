@@ -289,7 +289,7 @@ void sense()
 
         long computationTimeNanoseconds = 0;
 
-        printf("Sensing\n");
+        //printf("Sensing\n");
         
         pthread_mutex_lock(&sensorValuesMutex);
         
@@ -303,7 +303,7 @@ void sense()
         int semaphoreValue = 0;
         sem_getvalue(sensingControlRendevouzSemaphore, &semaphoreValue);
 
-        printf("Semaphore Value: %d\n", semaphoreValue);
+        //printf("Semaphore Value: %d\n", semaphoreValue);
 
         if(semaphoreValue <= 0)
         {
@@ -357,9 +357,9 @@ void controlBoilerLevel()
 
         float delta = 0.01;
         
-        printf("Controller 1 waiting \n");
+        //printf("Controller 1 waiting \n");
         sem_wait(sensingControlRendevouzSemaphore);
-        printf("Controlling 1\n");
+        //printf("Controlling 1\n");
         pthread_mutex_lock(&sensorValuesMutex);
         pthread_mutex_lock(&referenceValuesMutex);
 
@@ -416,9 +416,9 @@ void controlBoilerTemperature()
 
         float delta = 0.01;
 
-        printf("Controller 2 waiting \n");
+        //printf("Controller 2 waiting \n");
         sem_wait(sensingControlRendevouzSemaphore);
-        printf("Controlling 2\n");
+        //printf("Controlling 2\n");
 
         pthread_mutex_lock(&sensorValuesMutex);
         pthread_mutex_lock(&referenceValuesMutex);
@@ -485,9 +485,9 @@ void controlPlummingTemperature()
 
         float delta = 0.01;
 
-        printf("Controller 3 waiting \n");
+        //printf("Controller 3 waiting \n");
         sem_wait(sensingControlRendevouzSemaphore);
-        printf("Controlling 3\n");
+        //printf("Controlling 3\n");
 
         pthread_mutex_lock(&sensorValuesMutex);
         pthread_mutex_lock(&referenceValuesMutex);
@@ -720,16 +720,15 @@ int main(int argc, char *argv[])
     pthread_create(&tControlBoilerLevel, NULL, (void *)controlBoilerLevel, NULL);
     pthread_create(&tControlBoilerTemperature, NULL, (void *)controlBoilerTemperature, NULL);
     pthread_create(&tControlPlummingTemperature, NULL, (void *)controlPlummingTemperature, NULL);
-    //pthread_create(&tReportState, NULL, (void *)reportState, NULL);
+    pthread_create(&tReportState, NULL, (void *)reportState, NULL);
     pthread_create(&tUpdateReference, NULL, (void *)updateReference, NULL);
 
     pthread_join(tSense, NULL);
     pthread_join(tControlBoilerLevel, NULL);
     pthread_join(tControlBoilerTemperature, NULL);
     pthread_join(tControlPlummingTemperature, NULL);
-    //pthread_join(tReportState, NULL);
+    pthread_join(tReportState, NULL);
     pthread_join(tUpdateReference, NULL);
-
 }
 
 
