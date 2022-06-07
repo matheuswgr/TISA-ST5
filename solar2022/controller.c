@@ -9,13 +9,12 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <time.h>
-
+#include <pthread.h>
+#include <semaphore.h>
 
 #define FALHA 1
 
 #define	TAM_MEU_BUFFER	1000
-
-int cycleCounter;
 
 int isCollectorPumpOn;
 int isRecirculatorPumpOn;
@@ -23,8 +22,31 @@ int isBoilerHeaterOn;
 int isWaterInletOn;
 int isWaterOutletOn;
 
-int nanosseconds;
-long measuredPeriod;
+float boiler_level;
+float boiler_temperature;
+float plumbing_temperature;
+float colector_temperature;
+
+float boiler_level_reference;
+float boiler_temperature_reference;
+float plumbing_temperature_reference;
+
+pthread_mutex_t sensorValuesMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t referenceValuesMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t screenMutex = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_t tSense;
+pthread_t tControlBoilerLevel;
+pthread_t tControlBoilerTemperature;
+pthread_t tControlPlummingTemperature;
+pthread_t tReportState;
+pthread_t tUpdateReference;
+
+sem_t* sensingControlRendevouzSemaphore;
+
+int local_socket;
+
+struct sockaddr_in destination_address;
 
 int cria_socket_local(void)
 {
@@ -73,7 +95,6 @@ void envia_mensagem(int socket_local, struct sockaddr_in endereco_destino, char 
 	}
 }
 
-
 int recebe_mensagem(int socket_local, char *buffer, int TAM_BUFFER)
 {
 	int bytes_recebidos;		/* N�mero de bytes recebidos */
@@ -96,8 +117,6 @@ float read_boiler_level(int local_socket, struct sockaddr_in destination_address
 	envia_mensagem(local_socket, destination_address, "nivelboiler");
 	nrec = recebe_mensagem(local_socket, response, 1000);
 
-    //printf("Boiler level response: %s", response);
-
     char value[6];
     int i;
 
@@ -105,8 +124,6 @@ float read_boiler_level(int local_socket, struct sockaddr_in destination_address
     {
         value[i-13] = response[i];
     }
-
-    //printf("\t\t Boiler level value: %f\n\n", (float)atof(value));
 
     return (float)atof(value);
 }
@@ -119,8 +136,6 @@ float read_boiler_temperature(int local_socket, struct sockaddr_in destination_a
 	envia_mensagem(local_socket, destination_address, "tempboiler");
 	nrec = recebe_mensagem(local_socket, response, 1000);
 
-    //printf("Boiler temperature response: %s", response);
-
     char value[6];
     int i;
 
@@ -128,8 +143,6 @@ float read_boiler_temperature(int local_socket, struct sockaddr_in destination_a
     {
         value[i-12] = response[i];
     }
-
-    //printf("\t\t Boiler temperature value: %f\n\n", (float)atof(value));
 
     return (float)atof(value);
 }
@@ -142,8 +155,6 @@ float read_plumbing_temperature(int local_socket, struct sockaddr_in destination
 	envia_mensagem(local_socket, destination_address, "tempcanos");
 	nrec = recebe_mensagem(local_socket, response, 1000);
 
-    //printf("plumbing temperature response: %s", response);
-
     char value[6];
     int i;
 
@@ -151,8 +162,6 @@ float read_plumbing_temperature(int local_socket, struct sockaddr_in destination
     {
         value[i-11] = response[i];
     }
-
-    //printf("\t\t Plumbing temperature value: %f\n\n", (float)atof(value));
 
     return (float)atof(value);
 }
@@ -165,8 +174,6 @@ float read_colector_temperature(int local_socket, struct sockaddr_in destination
 	envia_mensagem(local_socket, destination_address, "tempcoletor");
 	nrec = recebe_mensagem(local_socket, response, 1000);
 
-    //printf("collector temperature response: %s", response);
-
     char value[6];
     int i;
 
@@ -174,8 +181,6 @@ float read_colector_temperature(int local_socket, struct sockaddr_in destination
     {
         value[i-13] = response[i];
     }
-
-    //printf("\t\t collector temperature value: %f\n\n", (float)atof(value));
 
     return (float)atof(value);
 }
@@ -270,94 +275,310 @@ void turn_off_water_outlet(int local_socket, struct sockaddr_in destination_addr
     nrec = recebe_mensagem(local_socket, response, 1000);
 }
 
-void updateState(int local_socket, struct sockaddr_in destination_address)
+void sense()
 {
-    float boiler_level = read_boiler_level(local_socket, destination_address);
-    float boiler_temperature = read_boiler_temperature(local_socket, destination_address);
-    float plumbing_temperature = read_plumbing_temperature(local_socket, destination_address);
-    float colector_temperature = read_colector_temperature(local_socket, destination_address);
-
-    float delta = 0.01;
-
-    float boiler_level_reference = 0.48;
-    float boiler_temperature_reference = 26.0;
-    float plumbing_temperature_reference = 24.0;
-
-    if( boiler_temperature < boiler_temperature_reference*(1-delta) )
+    while(1)
     {
-        if ( colector_temperature > boiler_temperature*(1+delta) )
+        struct timespec computationBegging;
+        clock_gettime(CLOCK_MONOTONIC,&computationBegging);    
+        
+        int periodNs = 30000000;
+        
+        struct timespec computationFinish;
+        struct timespec sleepTime;
+
+        long computationTimeNanoseconds = 0;
+
+        printf("Sensing\n");
+        
+        pthread_mutex_lock(&sensorValuesMutex);
+        
+        boiler_level = read_boiler_level(local_socket, destination_address);
+        boiler_temperature = read_boiler_temperature(local_socket, destination_address);
+        plumbing_temperature = read_plumbing_temperature(local_socket, destination_address);
+        colector_temperature = read_colector_temperature(local_socket, destination_address);
+        
+        pthread_mutex_unlock(&sensorValuesMutex);
+
+        int semaphoreValue = 0;
+        sem_getvalue(sensingControlRendevouzSemaphore, &semaphoreValue);
+
+        printf("Semaphore Value: %d\n", semaphoreValue);
+
+        if(semaphoreValue <= 0)
         {
-            turn_on_colector_pump(local_socket, destination_address);
+            sem_post(sensingControlRendevouzSemaphore);
+            sem_post(sensingControlRendevouzSemaphore);
+            sem_post(sensingControlRendevouzSemaphore);
         }
-        else if( boiler_temperature > boiler_temperature_reference*(1+delta) )
+
+        clock_gettime(CLOCK_MONOTONIC,&computationFinish);
+
+        computationTimeNanoseconds = computationFinish.tv_sec*1000000000 - computationBegging.tv_sec*1000000000 + computationFinish.tv_nsec- computationBegging.tv_nsec;
+
+        sleepTime.tv_nsec = periodNs - computationTimeNanoseconds;
+        sleepTime.tv_sec = 0;
+
+        nanosleep(&sleepTime, NULL);
+    }
+}
+
+void initialize()
+{
+    isCollectorPumpOn = 0;
+    isRecirculatorPumpOn = 0;
+    isBoilerHeaterOn = 0;
+    isWaterInletOn = 0;
+    isWaterOutletOn = 0;
+
+    boiler_level_reference = -1;
+    boiler_temperature_reference = -1;
+    plumbing_temperature_reference = -1;
+
+    boiler_level = read_boiler_level(local_socket, destination_address);
+    boiler_temperature = read_boiler_temperature(local_socket, destination_address);
+    plumbing_temperature = read_plumbing_temperature(local_socket, destination_address);
+    colector_temperature = read_colector_temperature(local_socket, destination_address);
+}
+
+void controlBoilerLevel()
+{    
+    while(1)
+    {
+        struct timespec computationBegging;
+        clock_gettime(CLOCK_MONOTONIC,&computationBegging);    
+        
+        int periodNs = 30000000;
+        
+        struct timespec computationFinish;
+        struct timespec sleepTime;
+
+        long computationTimeNanoseconds = 0;
+
+        float delta = 0.01;
+        
+        printf("Controller 1 waiting \n");
+        sem_wait(sensingControlRendevouzSemaphore);
+        printf("Controlling 1\n");
+        pthread_mutex_lock(&sensorValuesMutex);
+        pthread_mutex_lock(&referenceValuesMutex);
+
+        if(boiler_level_reference != -1)
         {
-            turn_off_colector_pump(local_socket, destination_address);
-        }
-    }
-    else  if( boiler_temperature > boiler_temperature_reference*(1+delta) )
-    {
-        turn_off_colector_pump(local_socket, destination_address);
-    }
+            if( boiler_level < boiler_level_reference*(1-delta) )
+            {
+                turn_on_water_inlet(local_socket, destination_address);
+            }
+            else 
+            if (boiler_level > boiler_level_reference*(1+delta))
+            {
+                turn_off_water_inlet(local_socket, destination_address);
+            }
 
-    if (plumbing_temperature < plumbing_temperature_reference*(1-delta))
+            if( boiler_level > boiler_level_reference*(1+2*delta) )
+            {
+                turn_on_water_outlet(local_socket, destination_address);
+            }
+            else 
+            if( boiler_level < boiler_level_reference*(1-0.5*delta) )
+            {
+                turn_off_water_outlet(local_socket, destination_address);
+            }
+        }
+
+        pthread_mutex_unlock(&referenceValuesMutex);
+        pthread_mutex_unlock(&sensorValuesMutex);
+
+        clock_gettime(CLOCK_MONOTONIC,&computationFinish);
+
+        computationTimeNanoseconds = computationFinish.tv_sec*1000000000 - computationBegging.tv_sec*1000000000 + computationFinish.tv_nsec- computationBegging.tv_nsec;
+
+        sleepTime.tv_nsec = periodNs - computationTimeNanoseconds;
+        sleepTime.tv_sec = 0;
+
+        nanosleep(&sleepTime, NULL);
+    }
+}
+
+void controlBoilerTemperature()
+{
+    while(1)
     {
-        if (boiler_temperature > plumbing_temperature*(1+delta))
+        struct timespec computationBegging;
+        clock_gettime(CLOCK_MONOTONIC,&computationBegging);    
+        
+        int periodNs = 30000000;
+        
+        struct timespec computationFinish;
+        struct timespec sleepTime;
+
+        long computationTimeNanoseconds = 0;
+
+        float delta = 0.01;
+
+        printf("Controller 2 waiting \n");
+        sem_wait(sensingControlRendevouzSemaphore);
+        printf("Controlling 2\n");
+
+        pthread_mutex_lock(&sensorValuesMutex);
+        pthread_mutex_lock(&referenceValuesMutex);
+
+
+        if(boiler_temperature_reference != -1)
         {
-            turn_on_recirculation_pump(local_socket, destination_address);
+            if( boiler_temperature < boiler_temperature_reference*(1-delta) )
+            {
+                if ( colector_temperature > boiler_temperature*(1+delta) )
+                {
+                    turn_on_colector_pump(local_socket, destination_address);
+                }
+                else 
+                if( boiler_temperature > boiler_temperature_reference*(1+delta) )
+                {
+                    turn_off_colector_pump(local_socket, destination_address);
+                }
+            }
+            else  
+            if( boiler_temperature > boiler_temperature_reference*(1+delta) )
+            {
+                turn_off_colector_pump(local_socket, destination_address);
+            }
+
+            if( boiler_temperature < boiler_temperature_reference*(1-delta) )
+            {
+                turn_on_boiler_heater(local_socket, destination_address);
+            }
+            else 
+            if( boiler_temperature > boiler_temperature_reference*(1+delta))
+            {
+                turn_off_boiler_heater(local_socket, destination_address);
+            }
         }
-        else if (plumbing_temperature > plumbing_temperature_reference*(1+delta))
+
+        pthread_mutex_unlock(&referenceValuesMutex);
+        pthread_mutex_unlock(&sensorValuesMutex);
+
+        clock_gettime(CLOCK_MONOTONIC,&computationFinish);
+
+        computationTimeNanoseconds = computationFinish.tv_sec*1000000000 - computationBegging.tv_sec*1000000000 + computationFinish.tv_nsec- computationBegging.tv_nsec;
+
+        sleepTime.tv_nsec = periodNs - computationTimeNanoseconds;
+        sleepTime.tv_sec = 0;
+
+        nanosleep(&sleepTime, NULL);
+    }
+}        
+
+void controlPlummingTemperature()
+{
+    while(1)
+    {
+        struct timespec computationBegging;
+        clock_gettime(CLOCK_MONOTONIC,&computationBegging);    
+        
+        int periodNs = 30000000;
+        
+        struct timespec computationFinish;
+        struct timespec sleepTime;
+
+        long computationTimeNanoseconds = 0;
+
+        float delta = 0.01;
+
+        printf("Controller 3 waiting \n");
+        sem_wait(sensingControlRendevouzSemaphore);
+        printf("Controlling 3\n");
+
+        pthread_mutex_lock(&sensorValuesMutex);
+        pthread_mutex_lock(&referenceValuesMutex);
+
+        if(plumbing_temperature_reference != -1)
         {
-            turn_off_recirculation_pump(local_socket, destination_address);
+            if (plumbing_temperature < plumbing_temperature_reference*(1-delta))
+            {
+                if (boiler_temperature > plumbing_temperature*(1+delta))
+                {
+                    turn_on_recirculation_pump(local_socket, destination_address);
+                }
+                else 
+                if (plumbing_temperature > plumbing_temperature_reference*(1+delta))
+                {
+                    turn_off_recirculation_pump(local_socket, destination_address);
+                }
+            }
+            else 
+            if (plumbing_temperature > plumbing_temperature_reference*(1+delta))
+            {
+                turn_off_recirculation_pump(local_socket, destination_address);
+            }
         }
-    }
-    else if (plumbing_temperature > plumbing_temperature_reference*(1+delta))
-    {
-        turn_off_recirculation_pump(local_socket, destination_address);
-    }
 
-    if( boiler_temperature < boiler_temperature_reference*(1-delta) )
-    {
-        turn_on_boiler_heater(local_socket, destination_address);
-    }
-    else if( boiler_temperature > boiler_temperature_reference*(1+delta))
-    {
-        turn_off_boiler_heater(local_socket, destination_address);
-    }
+        pthread_mutex_unlock(&referenceValuesMutex);
+        pthread_mutex_unlock(&sensorValuesMutex);
 
-    if( boiler_level < boiler_level_reference*(1-delta) )
-    {
-        turn_on_water_inlet(local_socket, destination_address);
-    }
-    else if (boiler_level > boiler_level_reference*(1+delta))
-    {
-        turn_off_water_inlet(local_socket, destination_address);
-    }
+        clock_gettime(CLOCK_MONOTONIC,&computationFinish);
 
-    if( boiler_level > boiler_level_reference*(1+2*delta) )
-    {
-        turn_on_water_outlet(local_socket, destination_address);
-    }
-    else if( boiler_level < boiler_level_reference*(1-0.5*delta) )
-    {
-        turn_off_water_outlet(local_socket, destination_address);
-    }
+        computationTimeNanoseconds = computationFinish.tv_sec*1000000000 - computationBegging.tv_sec*1000000000 + computationFinish.tv_nsec- computationBegging.tv_nsec;
 
-    if(cycleCounter == 33)
+        sleepTime.tv_nsec = periodNs - computationTimeNanoseconds;
+        sleepTime.tv_sec = 0;
+
+        nanosleep(&sleepTime, NULL);
+    }
+}
+
+void reportState()
+{
+    while(1)
     {
-        cycleCounter = 0;
+        struct timespec computationBegging;
+        clock_gettime(CLOCK_MONOTONIC,&computationBegging);    
+        
+        int periodNs = 1000000000;
+        
+        struct timespec computationFinish;
+        struct timespec sleepTime;
+
+        long computationTimeNanoseconds = 0;
+
+        pthread_mutex_lock(&sensorValuesMutex);
+        pthread_mutex_lock(&screenMutex);
+        pthread_mutex_lock(&referenceValuesMutex);
+        
         printf("Boiler Level: %f\n", boiler_level);
-        printf("Desired Boiler Level: %f\n", boiler_level_reference);
-        printf("Boiler Level Error: %f\n", boiler_level_reference - boiler_level);
+        if(boiler_level_reference == -1)
+        {
+            printf("Desired Boiler Level: not set\n\n");
+        }
+        else
+        {
+            printf("Desired Boiler Level: %f\n", boiler_level_reference);
+            printf("Boiler Level Error: %f\n\n", boiler_level_reference - boiler_level);
+        }
 
         printf("Boiler Temperature: %f\n", boiler_temperature);
-        printf("Desired Boiler Temperature: %f\n", boiler_temperature_reference);
-        printf("Boiler Temperature Error: %f\n", boiler_temperature_reference-boiler_temperature);
+        if(boiler_temperature_reference == -1)
+        {
+            printf("Desired Boiler Temperature: not set\n\n");
+        }
+        else
+        {
+            printf("Desired Boiler Temperature: %f\n", boiler_temperature_reference);
+            printf("Boiler Temperature Error: %f\n\n", boiler_temperature_reference-boiler_temperature);
+        }
 
         printf("Plumming Temperature: %f\n", plumbing_temperature);
-        printf("Desired Plumming Temperature: %f\n", plumbing_temperature_reference);
-        printf("Plumming Temperature Error: %f\n", plumbing_temperature_reference-plumbing_temperature);
-
-        printf("Collector Temperature: %f\n", colector_temperature);
+        if(plumbing_temperature_reference == -1)
+        {
+            printf("Desired Plumming Temperature: not set\n\n");
+        }
+        else
+        {
+            printf("Desired Plumming Temperature: %f\n", plumbing_temperature_reference);
+            printf("Plumming Temperature Error: %f\n\n", plumbing_temperature_reference-plumbing_temperature);
+        }
+        
+        printf("Collector Temperature: %f\n\n", colector_temperature);
 
         printf("Collector Pump State: %d\n", isCollectorPumpOn);
         printf("Recirculator Pump State: %d\n", isRecirculatorPumpOn);
@@ -365,10 +586,113 @@ void updateState(int local_socket, struct sockaddr_in destination_address)
         printf("Water Inlet State: %d\n", isWaterInletOn);
         printf("Water Outlet State: %d\n\n", isWaterOutletOn);
 
-        printf("Measured Period: %d\n", measuredPeriod);
-        printf("Sleep Time: %d\n\n", nanosseconds);
-    }
+        pthread_mutex_unlock(&referenceValuesMutex);
+        pthread_mutex_unlock(&screenMutex);
+        pthread_mutex_unlock(&sensorValuesMutex);
 
+        clock_gettime(CLOCK_MONOTONIC,&computationFinish);
+
+        computationTimeNanoseconds = computationFinish.tv_sec*1000000000 - computationBegging.tv_sec*1000000000 + computationFinish.tv_nsec- computationBegging.tv_nsec;
+
+        sleepTime.tv_nsec = periodNs - computationTimeNanoseconds;
+        sleepTime.tv_sec = 0;
+
+        nanosleep(&sleepTime, NULL);                
+    }
+}
+
+void updateReference()
+{
+    char buffer[2000];
+    
+    while(1)
+    {
+        fgets(buffer,2000,stdin);
+        pthread_mutex_lock(&screenMutex);
+
+        int referenceValueOption = 0;
+
+        while(referenceValueOption == 0)
+        {
+            printf("Choose the reference value you want to set: \n");
+            printf("type 1 for Boiler Level \n");
+            printf("type 2 for Boiler Temperature \n");
+            printf("type 3 for Plumming Temperature \n");
+            printf("type 4 to Cancel \n");
+                            
+            fgets(buffer,2000,stdin);
+
+            referenceValueOption = atoi(buffer);
+
+            if(referenceValueOption < 1 || referenceValueOption > 4)
+            {
+                printf("Invalid Option\n");
+                referenceValueOption = 0;
+            }
+        }
+
+        int referenceValidity = 0;
+        float newReferenceValue = 0;
+
+        while(referenceValidity == 0 && referenceValueOption != 4)
+        {
+            printf("Type the desired reference value (type -1 to cancel)\n");
+            fgets(buffer,2000,stdin);
+            newReferenceValue = (float)atof(buffer);
+
+            if(newReferenceValue < 0)
+            {
+                break;
+            }
+            
+            if(referenceValueOption == 1)
+            {
+                if(newReferenceValue > 0.6 || newReferenceValue < 0.0)
+                {
+                    printf("The desired boiler level reference should be smaller than 0.6 and greater than 0\n");
+                }
+                else
+                {
+                    referenceValidity = 1;
+                    pthread_mutex_lock(&referenceValuesMutex);
+                    boiler_level_reference = newReferenceValue;
+                    pthread_mutex_unlock(&referenceValuesMutex);
+                }
+            }
+            else
+            if(referenceValueOption == 2)
+            {
+                if(newReferenceValue > 80.0 || newReferenceValue < 1.0)
+                {
+                    printf("The desired boiler temperature reference should be smaller than 80 and greater than 1\n");
+                }
+                else
+                {
+                    referenceValidity = 1;
+                    pthread_mutex_lock(&referenceValuesMutex);
+                    boiler_temperature_reference = newReferenceValue;
+                    pthread_mutex_unlock(&referenceValuesMutex);
+                }
+            }
+            else
+            if(referenceValueOption == 3)
+            {
+                if(newReferenceValue > 80.0 || newReferenceValue < 1.0)
+                {
+                    printf("The desired plumming temperature reference should be smaller than 80 and greater than 1\n");
+                }
+                else
+                {
+                    referenceValidity = 1;
+                    pthread_mutex_lock(&referenceValuesMutex);
+                    plumbing_temperature_reference = newReferenceValue;
+                    pthread_mutex_unlock(&referenceValuesMutex);
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&screenMutex);
+    }
 }
 
 int main(int argc, char *argv[])
@@ -379,57 +703,34 @@ int main(int argc, char *argv[])
 		fprintf(stderr,"<porta> eh o numero da porta do servidor \n");
 		exit(FALHA);
 	}
+    
+    int porta_destino = atoi( argv[2]);
 
-	int porta_destino = atoi( argv[2]);
+	local_socket = cria_socket_local();
 
-	int socket_local = cria_socket_local();
+	destination_address = cria_endereco_destino(argv[1], porta_destino);
 
-	struct sockaddr_in endereco_destino = cria_endereco_destino(argv[1], porta_destino);
-        
-    struct timespec computationBegging;
-    struct timespec computationFinish;
-	struct timespec sleepTime;
-	struct timespec computationTime;
+    static const char *semaphoreName = "Semaphore";
 
-	int periodNs = 30000000;
+    sensingControlRendevouzSemaphore = sem_open(semaphoreName, O_CREAT, 0777, 0);
 
-    long computationTimeNanoseconds = 0;
+    initialize();
 
-	sleepTime.tv_sec = 1;
-	sleepTime.tv_nsec = 0;
+    pthread_create(&tSense, NULL, (void *)sense, NULL);
+    pthread_create(&tControlBoilerLevel, NULL, (void *)controlBoilerLevel, NULL);
+    pthread_create(&tControlBoilerTemperature, NULL, (void *)controlBoilerTemperature, NULL);
+    pthread_create(&tControlPlummingTemperature, NULL, (void *)controlPlummingTemperature, NULL);
+    //pthread_create(&tReportState, NULL, (void *)reportState, NULL);
+    pthread_create(&tUpdateReference, NULL, (void *)updateReference, NULL);
 
-    cycleCounter = 0;
+    pthread_join(tSense, NULL);
+    pthread_join(tControlBoilerLevel, NULL);
+    pthread_join(tControlBoilerTemperature, NULL);
+    pthread_join(tControlPlummingTemperature, NULL);
+    //pthread_join(tReportState, NULL);
+    pthread_join(tUpdateReference, NULL);
 
-    isCollectorPumpOn = 0;
-    isRecirculatorPumpOn = 0;
-    isBoilerHeaterOn = 0;
-    isWaterInletOn = 0;
-    isWaterOutletOn = 0;
-
-    while(1)
-    {
-        nanosleep(&sleepTime, NULL);
-        measuredPeriod = computationBegging.tv_sec*1000000000 + computationBegging.tv_nsec;
-		clock_gettime(CLOCK_MONOTONIC,&computationBegging);
-        measuredPeriod = computationBegging.tv_sec*1000000000 + computationBegging.tv_nsec-measuredPeriod;
-
-        //printf("period: %ld\n", measuredPeriod);
-	
-        updateState(socket_local,endereco_destino);
-        cycleCounter++;
-
-		clock_gettime(CLOCK_MONOTONIC,&computationFinish);
-
-        computationTimeNanoseconds = computationFinish.tv_sec*1000000000 - computationBegging.tv_sec*1000000000 + computationFinish.tv_nsec- computationBegging.tv_nsec;
-
-        sleepTime.tv_nsec = periodNs - computationTimeNanoseconds;
-
-        nanosseconds = sleepTime.tv_nsec;
-        sleepTime.tv_sec = 0;
-    }
-    // tomar cudidado com o nanosleep negativo !!!!! na virada do segundo (valor  do segundo X 1bi + nanossegundo)
 }
-
 
 
 
